@@ -41,9 +41,14 @@ class StreamingPathfinderResult:
     Attributes
     ----------
     samples : ndarray, shape (num_draws, N)
-        Posterior draws in the model's raveled unconstrained space.
-    logP, logQ : ndarray, shape (num_draws,)
-        Target and proposal log-densities of the returned draws.
+        Posterior draws in the model's raveled unconstrained space. When importance
+        sampling is active these are resampled from a larger proposal pool.
+    logP, logQ : ndarray
+        Target and proposal log-densities of the *proposal* draws (length equals the
+        proposal pool, ``num_proposal_draws``). They are the weights behind the
+        resampling and are row-aligned with ``samples`` only when importance sampling
+        is off (``None``/``"identity"``); after resampling they are proposal-space
+        diagnostics, not per-``samples``-row densities.
     elbo_trace : ndarray
         ELBO of every stored iterate, evaluated on the shared evaluation batch.
     elbo_argmax : int
@@ -83,6 +88,60 @@ def _elbo(logP, logQ):
     return elbo if np.isfinite(elbo) else -np.inf
 
 
+def _compile_batched_logp(model, terms, jacobian):
+    """Compile ``phi (M, N) -> logp (M,)`` over ``terms``, vectorized across draws.
+
+    Mirrors the vectorization in ``make_pathfinder_sample_fn``: build the single-draw
+    log-density over the raveled unconstrained value vector (same coordinate order as
+    the sampler's ``phi``), then batch it over a leading draw axis.
+    """
+    import pymc as pm
+    import pytensor.tensor as pt
+
+    from pymc.pytensorf import compile as pm_compile
+    from pytensor.graph import vectorize_graph
+
+    (logp_single,), single_input = pm.pytensorf.join_nonshared_inputs(
+        model.initial_point(), [model.logp(vars=terms, jacobian=jacobian)], model.value_vars, ()
+    )
+    phi = pt.matrix("phi")
+    batched = vectorize_graph(logp_single, replace={single_input: phi})
+    fn = pm_compile([phi], batched)
+    fn.trust_input = True
+    return fn
+
+
+def _full_data_logp(phi, loader, model, batch_var, prior_fn, obs_fn, n_total):
+    """Exact full-data ``logP(phi)`` for out-of-core data, in one streaming pass.
+
+    ``prior_fn`` (prior + Jacobian) is evaluated once; the observed log-likelihood is
+    summed across every batch of one complete epoch. Each batch's observed logp carries
+    the model's ``total_size=n_total`` rescaling (``(n_total / b) * batch_sum``), so it is
+    multiplied back by ``b / n_total`` to recover the exact batch sum. The result equals
+    ``model.logp`` on the full dataset (verified to machine precision), not the
+    subset-rescaled pseudo-density.
+
+    Assumes the single-observed-RV, ``total_size=n_total`` minibatch contract and that one
+    epoch of ``loader`` visits every row exactly once.
+    """
+    phi = np.asarray(phi, dtype=np.float64)
+    lp = np.asarray(prior_fn(phi), dtype=np.float64)  # (M,) prior + Jacobian, once
+    seen = 0
+    # A complete pass that visits every row (the training loader drops the tail).
+    epoch = loader.complete_batches() if hasattr(loader, "complete_batches") else loader
+    for batch in epoch:  # one complete epoch; order is irrelevant to the sum
+        b = np.asarray(batch)
+        model.set_data(batch_var, b)
+        lp = lp + (b.shape[0] / n_total) * np.asarray(obs_fn(phi), dtype=np.float64)
+        seen += b.shape[0]
+    if seen != n_total:
+        raise RuntimeError(
+            f"full-data logp pass visited {seen} rows but len(loader)={n_total}; the "
+            "loader must yield every row exactly once (no drop_last) for an exact logP."
+        )
+    return lp
+
+
 def fit_streaming_pathfinder(
     model,
     loader,
@@ -91,6 +150,7 @@ def fit_streaming_pathfinder(
     num_iters=200,
     num_elbo_draws=10,
     num_draws=1000,
+    num_proposal_draws=None,
     eval_rows=2000,
     jitter=2.0,
     jacobian_correction=True,
@@ -116,6 +176,11 @@ def fit_streaming_pathfinder(
         Monte-Carlo draws per iterate for ELBO selection.
     num_draws : int
         Draws returned from the selected Gaussian.
+    num_proposal_draws : int, optional
+        Size of the proposal pool importance sampling resamples down to ``num_draws``.
+        Defaults to ``4 * num_draws`` when resampling (so PSIS/PSIR actually reweight
+        rather than returning a permutation of ``num_draws`` proposals), else
+        ``num_draws``.
     eval_rows : int
         Rows in the fixed evaluation batch used for iterate selection.
     jitter : float
@@ -160,6 +225,10 @@ def fit_streaming_pathfinder(
     x_base = DictToArrayBijection.map(ip).data
     N = x_base.shape[0]
     sample_logp = make_pathfinder_sample_fn(model, N=N, J=J, jacobian=jacobian_correction)
+    # For the exact full-data target density (final logP + PSIS), evaluate the prior
+    # once and the observed likelihood summed across a full epoch (see _full_data_logp).
+    prior_logp_fn = _compile_batched_logp(model, model.free_RVs, jacobian=jacobian_correction)
+    obs_logp_fn = _compile_batched_logp(model, model.observed_RVs, jacobian=False)
 
     def value_grad_fn(x):
         value, grad = neg_logp_dlogp(np.asarray(x, dtype=np.float64))
@@ -213,16 +282,32 @@ def fit_streaming_pathfinder(
     best = traj.iterates[elbo_argmax]
 
     # --- phase 3: draw from the selected Gaussian (eval batch still set) ---
-    u_final = np.random.default_rng(final_ss).standard_normal((num_draws, N))
-    phi, logQ, logP, _ = sample_logp(
+    # Importance resampling must draw MORE proposals than it returns, or selecting
+    # num_draws from num_draws candidates without replacement is a no-op permutation
+    # (every proposal returned once, no reweighting). Draw a larger proposal pool
+    # and resample down to num_draws.
+    resample = importance_sampling not in (None, "identity")
+    if num_proposal_draws is not None:
+        n_prop = int(num_proposal_draws)
+    else:
+        n_prop = 4 * num_draws if resample else num_draws
+    if resample and n_prop <= num_draws:
+        n_prop = num_draws + 1  # guarantee a genuine resample
+    u_final = np.random.default_rng(final_ss).standard_normal((n_prop, N))
+    phi, logQ, _logP_subset, _ = sample_logp(
         best["x"], best["g"], best["alpha"], best["s_win"], best["z_win"], u_final
     )
-    samples = np.asarray(phi)
-    logP = np.asarray(logP)
-    logQ = np.asarray(logQ)
+    samples = np.asarray(phi)  # (n_prop, N) proposal draws
+    logQ = np.asarray(logQ)  # Gaussian proposal density (data-independent)
+    # The final importance target must be the EXACT full-data logP, not the eval-subset
+    # density sample_logp just returned (evaluated on the currently-set eval batch, which
+    # targets a rescaled subset pseudo-posterior). Recompute it in one streaming pass.
+    logP = _full_data_logp(
+        samples, loader, model, batch_var, prior_logp_fn, obs_logp_fn, n_total
+    )
 
     pareto_k = None
-    if importance_sampling is not None:
+    if resample:
         result = psis_fn(
             samples[None],
             logP[None],
@@ -231,8 +316,10 @@ def fit_streaming_pathfinder(
             method=importance_sampling,
             random_seed=int(final_ss.generate_state(1)[0]),
         )
-        samples = np.asarray(result.samples)
+        samples = np.asarray(result.samples)  # (num_draws, N) resampled from the n_prop proposals
         pareto_k = result.pareto_k
+    else:
+        samples = samples[:num_draws]
 
     return StreamingPathfinderResult(
         samples=samples,

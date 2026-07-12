@@ -166,3 +166,32 @@ def test_violation_rate_below_20pct():
         model, loader, num_iters=200, num_draws=500, eval_rows=1000, random_seed=0, lbfgs_config=CFG
     )
     assert res.violation_rate < 0.20, f"violation rate {res.violation_rate:.3f}"
+
+
+def test_full_data_logp_exact_with_tail():
+    """Streaming full-data logP equals model.logp over the whole dataset, including the
+    trailing partial batch the training loader drops (G8 regression)."""
+    from models import gaussian_regression
+    from pymc_extras.inference.pathfinder.bfgs_sample import get_neg_logp_dlogp_of_ravel_inputs
+
+    from pymc_streaming_lab.streaming_pathfinder import _compile_batched_logp, _full_data_logp
+
+    rng = np.random.default_rng(0)
+    k, n = 3, 350  # 350 is not divisible by 128 -> a genuine partial tail
+    X = rng.normal(size=(n, k))
+    y = X @ np.array([1.0, -0.5, 0.3]) + rng.normal(0, 1.0, size=n)
+    model, packed, *_ = gaussian_regression(X, y, 1.0)
+    loader = make_loader(packed, batch_size=128, shuffle=True, seed=1)
+
+    # the complete pass visits every row exactly once, tail included
+    assert sum(b.shape[0] for b in loader.complete_batches()) == n
+
+    prior_fn = _compile_batched_logp(model, model.free_RVs, jacobian=True)
+    obs_fn = _compile_batched_logp(model, model.observed_RVs, jacobian=False)
+    nlp = get_neg_logp_dlogp_of_ravel_inputs(model, jacobian=True)
+    phi = rng.normal(size=(5, k))
+    got = _full_data_logp(phi, loader, model, "batch", prior_fn, obs_fn, n)
+    for i in range(phi.shape[0]):
+        model.set_data("batch", packed)  # full data in the placeholder = the exact truth
+        truth = -nlp(phi[i].astype(np.float64))[0]
+        assert abs(got[i] - truth) < 1e-6, (i, got[i], truth)
