@@ -75,7 +75,7 @@ def make_converged(n_curves, t_star, horizon=HORIZON, rng=None):
 
 
 def simulate_monitor(
-    losses, kappa=0.25, h=10.0, halflife=200.0, min_steps=1000, z_clip=4.0, sigma_floor=1e-12
+    losses, kappa=0.25, h=20.0, halflife=200.0, min_steps=1000, z_clip=4.0, sigma_floor=1e-12
 ):
     """Vectorized twin of ``StreamingConvergenceMonitor`` across many curves.
 

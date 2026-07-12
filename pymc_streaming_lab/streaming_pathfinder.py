@@ -67,10 +67,20 @@ class StreamingPathfinderResult:
 
 
 def _elbo(logP, logQ):
-    """Mean of finite ``logP - logQ`` draws, or -inf if none are finite."""
-    diff = np.asarray(logP) - np.asarray(logQ)
-    finite = np.isfinite(diff)
-    return float(diff[finite].mean()) if finite.any() else -np.inf
+    """Mean ELBO over the draws, matching upstream ``LBFGSStreamingCallback``.
+
+    A single draw with non-finite ``logP`` (proposal mass where the target has zero
+    density) collapses the estimate to ``-inf`` rather than being dropped, so a
+    support-violating iterate cannot outscore a valid one.
+    """
+    logP = np.asarray(logP)
+    logQ = np.asarray(logQ)
+    finite = np.isfinite(logP)
+    if not np.any(finite):
+        return -np.inf
+    logP_safe = np.where(finite, logP, -np.inf)
+    elbo = float(np.mean(logP_safe - logQ))
+    return elbo if np.isfinite(elbo) else -np.inf
 
 
 def fit_streaming_pathfinder(

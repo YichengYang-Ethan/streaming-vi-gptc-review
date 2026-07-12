@@ -95,9 +95,13 @@ class StreamingConvergenceMonitor:
     improvement rate sits *below* roughly ``kappa`` robust standard deviations
     per step is, by the allowance's definition, treated as converged — pick
     ``kappa`` to match the smallest improvement rate worth waiting for. A jump
-    *upward* in loss (e.g. the stream's distribution shifts at an epoch
-    boundary) makes ``z`` negative, which drains ``S`` — the monitor
-    automatically withdraws its convergence evidence when the objective moves.
+    *upward* in loss makes ``z`` negative, so ``kappa - z`` is larger than
+    ``kappa`` and ``S`` climbs *faster* — the monitor reads a sustained upward
+    move as "stalled or worsening" and stops sooner. Whether a distribution
+    shift at an epoch boundary should instead *drain* ``S`` (keep training and
+    re-converge to the shifted objective) is an open design question, deferred
+    to the fit-method rework; the calibration families are all still-improving,
+    so this path does not affect the frozen defaults below.
 
     Examples
     --------

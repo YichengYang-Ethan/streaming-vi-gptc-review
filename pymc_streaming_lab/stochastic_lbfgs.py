@@ -209,9 +209,13 @@ def run_stochastic_lbfgs(value_grad_fn, on_batch_advance, x0, num_iters, config=
             t *= config.backtrack
         if not ls_ok:
             traj.n_ls_failures += 1
-            # take the smallest tried step so the optimizer still moves
-            x_new = x + t * d
-            f_new, g_new = value_grad_fn(x_new)
+            # A failed line search gives no trusted step: never force an untested
+            # move into the curvature history (that both pollutes the L-BFGS memory
+            # and lets violation_rate read 0% on a stuck run). Hold x, advance the
+            # batch, and try again on fresh data.
+            on_batch_advance()
+            f, g = value_grad_fn(x)
+            continue
 
         s = x_new - x
         y = g_new - g
